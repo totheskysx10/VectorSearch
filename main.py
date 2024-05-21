@@ -4,6 +4,7 @@ import faiss
 from transformers import AutoTokenizer, AutoModel
 import torch
 from flask import Flask, request, jsonify
+import numpy as np
 
 app = Flask(__name__)
 
@@ -93,12 +94,10 @@ def delete_title():
     title_to_delete = data.get('text', None)
 
     if title_to_delete in texts:
+        doc_index = list(texts.keys()).index(title_to_delete)
         del texts[title_to_delete]
 
-        document_embeddings, document_keys = embed_documents(texts, model, tokenizer)
-
-        index.reset()
-        index.add(document_embeddings.numpy())
+        index.remove_ids(np.array([doc_index], dtype=np.int64))
 
         return jsonify({"message": "Document deleted successfully"}), 200
     else:
