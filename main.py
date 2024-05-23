@@ -9,12 +9,11 @@ import numpy as np
 app = Flask(__name__)
 
 # Настройки для подключения к базе данных PostgreSQL
-DB_HOST = "localhost"
-DB_PORT = "5432"
-DB_NAME = "postgres"
-DB_USER = "postgres"
-DB_PASS = "1"
-
+DB_HOST = os.getenv('DB_HOST', 'localhost')
+DB_PORT = os.getenv('DB_PORT', '5432')
+DB_NAME = os.getenv('DB_NAME', 'postgres')
+DB_USER = os.getenv('DB_USER', 'postgres')
+DB_PASS = os.getenv('DB_PASS', '1')
 # Установка переменной окружения для OpenMP
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
