@@ -60,7 +60,7 @@ document_embeddings, document_keys = embed_documents(texts, model, tokenizer)
 index = faiss.IndexFlatL2(document_embeddings.shape[1])
 index.add(document_embeddings.numpy())
 
-def retrieve_documents(query, index, model, tokenizer, texts, top_k=2):
+def retrieve_documents(query, index, model, tokenizer, texts, top_k=4):
     query_embedding = embed_documents({query: 0}, model, tokenizer)[0].numpy()
     distances, indices = index.search(query_embedding, top_k)
     values = list(texts.values())
