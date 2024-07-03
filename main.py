@@ -1,10 +1,11 @@
 import os
 import psycopg2
-import faiss
-from transformers import AutoTokenizer, AutoModel
 import torch
 from flask import Flask, request, jsonify
-import numpy as np
+from qdrant_client.http.models import PointStruct, VectorParams, Distance
+from transformers import AutoTokenizer, AutoModel
+from qdrant_client import QdrantClient, models
+from qdrant_client.http import models as rest
 
 app = Flask(__name__)
 
@@ -17,14 +18,23 @@ DB_PASS = os.getenv('DB_PASS', '1')
 # Установка переменной окружения для OpenMP
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
+# Настройки для подключения к Qdrant
+QDRANT_HOST = os.getenv('QDRANT_HOST', 'localhost')
+QDRANT_PORT = os.getenv('QDRANT_PORT', 6333)
+
 # Загрузка токенизатора и модели
 tokenizer = AutoTokenizer.from_pretrained("intfloat/multilingual-e5-large")
 model = AutoModel.from_pretrained("intfloat/multilingual-e5-large")
 
+# Инициализация клиента Qdrant
+qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
-def fetch_texts_from_db():
+# Название коллекции Qdrant
+COLLECTION_NAME = 'item_embeddings'
+
+
+def fetch_texts_from_db(batch_size=10):
     connection = None
-    texts = {}
     try:
         # Подключение к базе данных
         connection = psycopg2.connect(
@@ -37,17 +47,17 @@ def fetch_texts_from_db():
         cursor = connection.cursor()
         # Выполнение SQL-запроса для получения данных из таблицы items
         cursor.execute("SELECT item_id, item_title, item_description FROM items")
-        rows = cursor.fetchall()
-        # Извлечение текста из каждой строки результата и создание словаря
-        texts = {row[1] + " " + row[2]: row[0] for row in rows}
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                break
+            texts = {row[1] + " " + row[2]: row[0] for row in rows}
+            yield texts
     except (Exception, psycopg2.DatabaseError) as error:
         print(error)
     finally:
         if connection is not None:
             connection.close()
-    return texts
-
-texts = fetch_texts_from_db()
 
 def embed_documents(documents_dict, model, tokenizer):
     documents = list(documents_dict.keys())
@@ -56,15 +66,50 @@ def embed_documents(documents_dict, model, tokenizer):
         embeddings = model(**inputs).last_hidden_state.mean(dim=1)
     return embeddings, documents
 
-document_embeddings, document_keys = embed_documents(texts, model, tokenizer)
-index = faiss.IndexFlatL2(document_embeddings.shape[1])
-index.add(document_embeddings.numpy())
+def add_embeddings_to_qdrant(texts, model, tokenizer):
+    embeddings, documents = embed_documents(texts, model, tokenizer)
+    for doc, embedding in zip(documents, embeddings):
+        qdrant_client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[rest.PointStruct(id=texts[doc], vector=embedding.numpy().tolist(), payload={"text": doc})]
+        )
 
-def retrieve_documents(query, index, model, tokenizer, texts, top_k=4):
-    query_embedding = embed_documents({query: 0}, model, tokenizer)[0].numpy()
-    distances, indices = index.search(query_embedding, top_k)
-    values = list(texts.values())
-    return [values[i] for i in indices[0]]
+def sync_embeddings(texts_generator, model, tokenizer):
+    points, _ = qdrant_client.scroll(collection_name=COLLECTION_NAME, limit=10000)
+    existing_texts = set(point.payload["text"] for point in points)
+
+    for texts in texts_generator:
+        texts_to_remove = existing_texts - set(texts.keys())
+
+        if texts_to_remove:
+            points_to_remove = [point.id for point in points if point.payload['text'] in texts_to_remove]
+            qdrant_client.delete(collection_name=COLLECTION_NAME, points_selector=points_to_remove)
+
+        new_texts = {text: texts[text] for text in texts if text not in existing_texts}
+        if new_texts:
+            add_embeddings_to_qdrant(new_texts, model, tokenizer)
+
+def create_qdrant_collection():
+    collections = qdrant_client.get_collections()
+    collections_list = [c.name for collection in collections for c in list(collection[1])]
+    if COLLECTION_NAME not in collections_list:
+        qdrant_client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(size=1024, distance=Distance.COSINE)
+        )
+    texts_generator = fetch_texts_from_db()
+    sync_embeddings(texts_generator, model, tokenizer)
+
+def retrieve_documents(query, qdrant_client, model, tokenizer, top_k=4):
+    query_embedding = embed_documents({query: 0}, model, tokenizer)[0].squeeze(0).tolist() # Преобразование в список чисел
+    search_result = qdrant_client.search(
+        collection_name=COLLECTION_NAME,
+        query_vector=query_embedding,
+        limit=top_k
+    )
+
+    return [item.id for item in search_result]
+
 
 @app.route('/get_emb', methods=['POST'])
 def get_emb():
@@ -72,8 +117,9 @@ def get_emb():
     dialog_data = data.get('dialog', [])
     text = " ".join(dialog_data) + ' '
 
-    results = retrieve_documents(text, index, model, tokenizer, texts)
+    results = retrieve_documents(text, qdrant_client, model, tokenizer)
     return jsonify(results)
+
 
 @app.route('/add_title', methods=['POST'])
 def add_title():
@@ -81,26 +127,43 @@ def add_title():
     new_text = data.get('text', None)
     new_id = data.get('id', None)
 
-    texts[new_text] = new_id
-    new_embedding = embed_documents({new_text: 0}, model, tokenizer)[0].numpy()
-    index.add(new_embedding)
+    if new_text and new_id:
+        new_embedding = embed_documents({new_text: 0}, model, tokenizer)[0].squeeze(0).tolist()
+        qdrant_client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[rest.PointStruct(id=new_id, vector=new_embedding, payload={"text": new_text})]
+        )
+        return jsonify({"message": "Document added successfully"}), 200
+    else:
+        return jsonify({"message": "Invalid input"}), 400
 
-    return jsonify({"message": "Document added successfully"}), 200
 
 @app.route('/delete_title', methods=['POST'])
 def delete_title():
     data = request.json
     title_to_delete = data.get('text', None)
 
-    if title_to_delete in texts:
-        doc_index = list(texts.keys()).index(title_to_delete)
-        del texts[title_to_delete]
+    qdrant_client.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="text",
+                        match=models.MatchValue(value=title_to_delete),
+                    ),
+                ],
+            )
+        ),
+    )
+    return jsonify({"message": "Document deleted successfully"}), 200
 
-        index.remove_ids(np.array([doc_index], dtype=np.int64))
-
-        return jsonify({"message": "Document deleted successfully"}), 200
-    else:
-        return jsonify({"message": "Document not found"}), 404
+@app.route('/sync_database', methods=['POST'])
+def sync_database():
+    texts_generator = fetch_texts_from_db()
+    sync_embeddings(texts_generator, model, tokenizer)
+    return jsonify({"message": "Data sync successfully"}), 200
 
 if __name__ == '__main__':
+    create_qdrant_collection()
     app.run('0.0.0.0', port=5004)
