@@ -2,10 +2,11 @@ import os
 import psycopg2
 import torch
 from flask import Flask, request, jsonify
-from qdrant_client.http.models import PointStruct, VectorParams, Distance
+from qdrant_client.http.models import VectorParams, Distance
 from transformers import AutoTokenizer, AutoModel
 from qdrant_client import QdrantClient, models
 from qdrant_client.http import models as rest
+import gc
 
 app = Flask(__name__)
 
@@ -74,20 +75,20 @@ def add_embeddings_to_qdrant(texts, model, tokenizer):
             points=[rest.PointStruct(id=texts[doc], vector=embedding.numpy().tolist(), payload={"text": doc})]
         )
 
-def sync_embeddings(texts_generator, model, tokenizer):
+def sync_embeddings(texts, model, tokenizer):
     points, _ = qdrant_client.scroll(collection_name=COLLECTION_NAME, limit=10000)
     existing_texts = set(point.payload["text"] for point in points)
 
-    for texts in texts_generator:
-        texts_to_remove = existing_texts - set(texts.keys())
+    texts_to_remove = existing_texts - set(texts.keys())
 
-        if texts_to_remove:
-            points_to_remove = [point.id for point in points if point.payload['text'] in texts_to_remove]
-            qdrant_client.delete(collection_name=COLLECTION_NAME, points_selector=points_to_remove)
+    if texts_to_remove:
+        points_to_remove = [point.id for point in points if point.payload['text'] in texts_to_remove]
+        qdrant_client.delete(collection_name=COLLECTION_NAME, points_selector=points_to_remove)
 
-        new_texts = {text: texts[text] for text in texts if text not in existing_texts}
-        if new_texts:
-            add_embeddings_to_qdrant(new_texts, model, tokenizer)
+    new_texts = {text: texts[text] for text in texts if text not in existing_texts}
+    if new_texts:
+        add_embeddings_to_qdrant(new_texts, model, tokenizer)
+
 
 def create_qdrant_collection():
     collections = qdrant_client.get_collections()
@@ -98,7 +99,12 @@ def create_qdrant_collection():
             vectors_config=VectorParams(size=1024, distance=Distance.COSINE)
         )
     texts_generator = fetch_texts_from_db()
-    sync_embeddings(texts_generator, model, tokenizer)
+    all_texts = {}
+    for texts in texts_generator:
+        all_texts.update(texts)
+    sync_embeddings(all_texts, model, tokenizer)
+    del all_texts
+    gc.collect()
 
 def retrieve_documents(query, qdrant_client, model, tokenizer, top_k=4):
     query_embedding = embed_documents({query: 0}, model, tokenizer)[0].squeeze(0).tolist() # Преобразование в список чисел
@@ -161,7 +167,12 @@ def delete_title():
 @app.route('/sync_database', methods=['POST'])
 def sync_database():
     texts_generator = fetch_texts_from_db()
-    sync_embeddings(texts_generator, model, tokenizer)
+    all_texts = {}
+    for texts in texts_generator:
+        all_texts.update(texts)
+    sync_embeddings(all_texts, model, tokenizer)
+    del all_texts
+    gc.collect()
     return jsonify({"message": "Data sync successfully"}), 200
 
 if __name__ == '__main__':
