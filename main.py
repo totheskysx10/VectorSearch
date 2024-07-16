@@ -46,13 +46,30 @@ def fetch_texts_from_db(batch_size=10):
             password=DB_PASS
         )
         cursor = connection.cursor()
-        # Выполнение SQL-запроса для получения данных из таблицы items
-        cursor.execute("SELECT item_id, item_title, item_description FROM items")
+        # Выполнение SQL-запроса для получения данных из таблицы items с категориями
+        cursor.execute("""
+            SELECT i.item_id, i.item_title, i.item_description, c.category_title
+            FROM items i
+            LEFT JOIN categories c ON i.category_id = c.category_id
+        """)
         while True:
             rows = cursor.fetchmany(batch_size)
             if not rows:
                 break
-            texts = {row[1] + " " + row[2]: row[0] for row in rows}
+            texts = {}
+            for row in rows:
+                item_id = row[0]
+                item_title = row[1]
+                item_description = row[2]
+                category_title = row[3]
+
+                if category_title is None:
+                    text_key = f"{item_title} {item_description}"
+                else:
+                    text_key = f"{item_title} {category_title} {item_description}"
+
+                texts[text_key] = item_id
+
             yield texts
     except (Exception, psycopg2.DatabaseError) as error:
         print(error)
