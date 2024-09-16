@@ -46,12 +46,15 @@ def fetch_texts_from_db(batch_size=10):
             password=DB_PASS
         )
         cursor = connection.cursor()
-        # Выполнение SQL-запроса для получения данных из таблицы items с категориями
+
+        # Выполнение SQL-запроса для получения данных из таблицы items с категориями и ключевыми словами
         cursor.execute("""
-            SELECT i.item_id, i.item_title, i.item_description, c.category_title
+            SELECT i.item_id, i.item_title, i.item_description, c.category_title, 
+                   (SELECT STRING_AGG(k.keyword, ' ') FROM item_keywords k WHERE k.item_id = i.item_id) AS keywords
             FROM items i
             LEFT JOIN categories c ON i.category_id = c.category_id
         """)
+
         while True:
             rows = cursor.fetchmany(batch_size)
             if not rows:
@@ -62,11 +65,12 @@ def fetch_texts_from_db(batch_size=10):
                 item_title = row[1]
                 item_description = row[2]
                 category_title = row[3]
+                keywords = row[4]
 
-                if category_title is None:
-                    text_key = f"{item_title} {item_description}"
+                if not keywords:
+                    text_key = f"{item_title}  {category_title} {item_description}" if category_title else f"{item_title}  {item_description}"
                 else:
-                    text_key = f"{item_title} {category_title} {item_description}"
+                    text_key = f"{item_title} {keywords} {category_title} {item_description}" if category_title else f"{item_title} {keywords} {item_description}"
 
                 texts[text_key] = item_id
 
