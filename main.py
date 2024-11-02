@@ -141,8 +141,8 @@ def retrieve_documents(query, qdrant_client, model, tokenizer, top_k=4):
 @app.route('/get_emb', methods=['POST'])
 def get_emb():
     data = request.json
-    dialog_data = data.get('dialog', [])
-    text = " ".join(dialog_data) + ' '
+    text = data.get('request', '')
+    print(text)
 
     results = retrieve_documents(text, qdrant_client, model, tokenizer)
     return jsonify(results)
