@@ -1,4 +1,6 @@
 import os
+from asyncio import timeout
+
 import psycopg2
 import torch
 import torch.nn.functional as F
@@ -30,7 +32,7 @@ tokenizer = AutoTokenizer.from_pretrained("intfloat/multilingual-e5-large")
 model = AutoModel.from_pretrained("intfloat/multilingual-e5-large")
 
 # Инициализация клиента Qdrant
-qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=15)
 
 # Название коллекции Qdrant
 COLLECTION_NAME = 'item_embeddings'
@@ -157,7 +159,7 @@ def create_qdrant_collection():
     all_texts = {}
     for texts in texts_generator:
         all_texts.update(texts)
-    #sync_embeddings(all_texts, model, tokenizer)
+    sync_embeddings(all_texts, model, tokenizer)
     del all_texts
     gc.collect()
 
