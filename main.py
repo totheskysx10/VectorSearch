@@ -1,11 +1,13 @@
 import os
 import psycopg2
 import torch
+import torch.nn.functional as F
 from flask import Flask, request, jsonify
-from qdrant_client.http.models import VectorParams, Distance
+from qdrant_client.http.models import VectorParams, Distance, PointStruct
 from transformers import AutoTokenizer, AutoModel
 from qdrant_client import QdrantClient, models
 from qdrant_client.http import models as rest
+from threading import Lock
 import gc
 
 app = Flask(__name__)
@@ -49,7 +51,7 @@ def fetch_texts_from_db(batch_size=10):
 
         # Выполнение SQL-запроса для получения данных из таблицы items с категориями и ключевыми словами
         cursor.execute("""
-            SELECT i.item_id, i.item_title, i.item_description, c.category_title, 
+            SELECT i.item_id, i.item_title, i.item_description, c.category_title,
                    (SELECT STRING_AGG(k.keyword, ' ') FROM item_keywords k WHERE k.item_id = i.item_id) AS keywords
             FROM items i
             LEFT JOIN categories c ON i.category_id = c.category_id
@@ -81,30 +83,62 @@ def fetch_texts_from_db(batch_size=10):
         if connection is not None:
             connection.close()
 
+
 def embed_documents(documents_dict, model, tokenizer):
     documents = list(documents_dict.keys())
+    # Токенизируем документы
     inputs = tokenizer(documents, return_tensors='pt', padding=True, truncation=True)
+
     with torch.no_grad():
-        embeddings = model(**inputs).last_hidden_state.mean(dim=1)
+        # Получаем скрытые состояния модели
+        model_output = model(**inputs).last_hidden_state
+        # Получаем маску внимания
+        attention_mask = inputs['attention_mask']
+        # Используем взвешенное усреднение
+        embeddings = F.normalize(get_weighted_embeddings(model_output, attention_mask))
+
     return embeddings, documents
+
+
+def get_weighted_embeddings(model_output, attention_mask):
+    # Вычисляем веса внимания, нормализуя attention_mask
+    attention_weights = attention_mask / attention_mask.sum(dim=1, keepdim=True)
+    # Умножаем скрытые состояния на веса и суммируем по первому измерению
+    weighted_embeddings = (model_output * attention_weights.unsqueeze(-1)).sum(dim=1)
+    return weighted_embeddings
+
 
 def add_embeddings_to_qdrant(texts, model, tokenizer):
     embeddings, documents = embed_documents(texts, model, tokenizer)
     for doc, embedding in zip(documents, embeddings):
+        vector = embedding.squeeze(0).tolist()
+        points = [PointStruct(id=texts[doc], vector=vector, payload={"text": doc})]
         qdrant_client.upsert(
             collection_name=COLLECTION_NAME,
-            points=[rest.PointStruct(id=texts[doc], vector=embedding.numpy().tolist(), payload={"text": doc})]
+            points=points,
+            wait=True
         )
 
+
 def sync_embeddings(texts, model, tokenizer):
-    points, _ = qdrant_client.scroll(collection_name=COLLECTION_NAME, limit=10000)
-    existing_texts = set(point.payload["text"] for point in points)
+    existing_points = qdrant_client.scroll(collection_name=COLLECTION_NAME, limit=10000)[0]
+    existing_texts = {point.payload["text"] for point in existing_points}
 
     texts_to_remove = existing_texts - set(texts.keys())
-
     if texts_to_remove:
-        points_to_remove = [point.id for point in points if point.payload['text'] in texts_to_remove]
-        qdrant_client.delete(collection_name=COLLECTION_NAME, points_selector=points_to_remove)
+        qdrant_client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must_not=[
+                        models.FieldCondition(
+                            key="text",
+                            match=models.MatchValue(value=list(texts_to_remove))
+                        )
+                    ]
+                )
+            )
+        )
 
     new_texts = {text: texts[text] for text in texts if text not in existing_texts}
     if new_texts:
@@ -123,12 +157,14 @@ def create_qdrant_collection():
     all_texts = {}
     for texts in texts_generator:
         all_texts.update(texts)
-    sync_embeddings(all_texts, model, tokenizer)
+    #sync_embeddings(all_texts, model, tokenizer)
     del all_texts
     gc.collect()
 
+
 def retrieve_documents(query, qdrant_client, model, tokenizer, top_k=4):
-    query_embedding = embed_documents({query: 0}, model, tokenizer)[0].squeeze(0).tolist() # Преобразование в список чисел
+    query_embedding = embed_documents({query: 0}, model, tokenizer)[0].squeeze(
+        0).tolist()  # Преобразование в список чисел
     search_result = qdrant_client.search(
         collection_name=COLLECTION_NAME,
         query_vector=query_embedding,
@@ -185,16 +221,26 @@ def delete_title():
     )
     return jsonify({"message": "Document deleted successfully"}), 200
 
+
+sync_lock = Lock()
+
 @app.route('/sync_database', methods=['POST'])
 def sync_database():
-    texts_generator = fetch_texts_from_db()
-    all_texts = {}
-    for texts in texts_generator:
-        all_texts.update(texts)
-    sync_embeddings(all_texts, model, tokenizer)
-    del all_texts
-    gc.collect()
-    return jsonify({"message": "Data sync successfully"}), 200
+    if not sync_lock.acquire(blocking=False):  # Проверяем, свободна ли блокировка
+        return jsonify({"message": "Sync is already in progress"}), 429
+
+    try:
+        texts_generator = fetch_texts_from_db()
+        all_texts = {}
+        for texts in texts_generator:
+            all_texts.update(texts)
+        sync_embeddings(all_texts, model, tokenizer)
+        del all_texts
+        gc.collect()
+        return jsonify({"message": "Data synced successfully"}), 200
+    finally:
+        sync_lock.release()
+
 
 if __name__ == '__main__':
     create_qdrant_collection()
